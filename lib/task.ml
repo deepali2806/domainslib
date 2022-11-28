@@ -1,5 +1,10 @@
 open Effect
 open Effect.Deep
+open Unified_interface
+
+let counter = Atomic.make 0
+let m = Mutex.create ()
+let cv = Condition.create ()
 
 type 'a task = unit -> 'a
 
@@ -16,6 +21,7 @@ type pool_data = {
 }
 
 type pool = pool_data option Atomic.t
+let global_pool: pool option ref = ref (None)
 
 type 'a promise_state =
   Returned of 'a
@@ -76,6 +82,44 @@ let step (type a) (f : a -> unit) (v : a) : unit =
             | Raised (e,bt) -> discontinue_with_backtrace k e bt
           in
           loop ())
+       | Sched.Suspend f ->  Some (fun (k : (a, _) continuation) ->
+            let pool = (
+              match !global_pool with
+              | Some p -> p
+              | None -> raise Exit (* Pool not setup *)
+            ) in 
+              let pd = get_pool_data pool in 
+                let c = pd.task_chan in
+                    let resumer v = 
+                            (* if !sw then *)
+                            begin
+                              Atomic.decr counter;
+                              (
+                                if(Atomic.get counter = 0) then
+                                  Condition.signal cv
+                                else 
+                                  ()
+                              );
+                               (match v with
+                            | Ok x ->  cont x (k, c)
+                            | Error ex -> let bt = Printexc.get_raw_backtrace () in
+                                          discont ex bt (k, c)
+                          )
+                             
+                              (* true *)
+                            end
+                            (* else
+                              false  *)
+                      in
+              if (f resumer) then
+               begin 
+                  Atomic.incr counter; ()
+               end
+              else
+                begin 
+                discontinue k Exit
+                end      
+        )
       | _ -> None }
 
 let rec worker task_chan =
@@ -84,6 +128,7 @@ let rec worker task_chan =
   | Work f -> step f (); worker task_chan
 
 let run (type a) pool (f : unit -> a) : a =
+  global_pool := Some pool;
   let pd = get_pool_data pool in
   let p = Atomic.make (Pending []) in
   step (fun _ -> do_task f p) ();
@@ -98,7 +143,12 @@ let run (type a) pool (f : unit -> a) : a =
           with Exit -> Domain.cpu_relax ()
         end;
         loop ()
-   | Returned v -> v
+   | Returned v -> Mutex.lock m;
+                    while (Atomic.get counter) <> 0 do
+                      Condition.wait cv m
+                    done;
+                    Mutex.unlock m;
+                    v
    | Raised (e, bt) -> Printexc.raise_with_backtrace e bt
   in
   loop ()
